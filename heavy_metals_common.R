@@ -9,7 +9,7 @@ install_and_load <- function(packages) {
   }
 }
 
-required_packages <- c("readxl", "dplyr", "tidyr", "ggplot2", "pheatmap", "quantreg", "patchwork")
+required_packages <- c("readxl", "dplyr", "tidyr", "ggplot2", "pheatmap", "quantreg", "patchwork", "scales", "gridExtra")
 install_and_load(required_packages)
 
 data_file <- "HEAVY_METAL_DATA.xlsx"
@@ -411,4 +411,236 @@ run_quantile_regression_analysis <- function(target_symbol, output_number) {
   write.csv(data.frame(Quantile = quantiles, Slope = slopes, Intercept = intercepts), sprintf("%02d_quantile_%s_coefficients.csv", output_number, target_symbol), row.names = FALSE)
 
   invisible(list(coefficients = data.frame(Quantile = quantiles, Slope = slopes, Intercept = intercepts), plot_file = output_file))
+}
+
+run_cluster_heatmap_analysis <- function(output_number = 55) {
+  data <- read_heavy_metals_data()
+  metal_columns <- heavy_metal_columns(data)
+  numeric_data <- prepare_heavy_metals_numeric(data)
+
+  sample_labels <- as.character(data$Number)
+  rownames(numeric_data) <- sample_labels
+
+  scaled_data <- scale(numeric_data)
+  distance_matrix <- stats::dist(scaled_data, method = "euclidean")
+  hc <- stats::hclust(distance_matrix, method = "ward.D2")
+  clusters <- stats::cutree(hc, k = 5)
+
+  ordered_samples <- order(clusters, hc$order)
+  ordered_data <- t(scaled_data[ordered_samples, , drop = FALSE])
+  ordered_cluster_ids <- clusters[ordered_samples]
+
+  cluster_table <- data.frame(
+    Sample = names(ordered_cluster_ids),
+    Cluster = as.integer(ordered_cluster_ids),
+    stringsAsFactors = FALSE
+  )
+
+  cluster_sizes <- as.data.frame(table(cluster_table$Cluster))
+  names(cluster_sizes) <- c("Cluster", "Count")
+
+  cluster_composition <- lapply(sort(unique(cluster_table$Cluster)), function(cluster_id) {
+    sample_ids <- cluster_table$Sample[cluster_table$Cluster == cluster_id]
+    cluster_mean <- colMeans(numeric_data[match(sample_ids, sample_labels), , drop = FALSE], na.rm = TRUE)
+    top_metals <- names(sort(cluster_mean, decreasing = TRUE))[1:3]
+    top_values <- round(cluster_mean[top_metals], 1)
+    data.frame(
+      Cluster = cluster_id,
+      Samples = paste(sample_ids, collapse = ", "),
+      TopMetals = paste(sprintf("%s(%s)", top_metals, top_values), collapse = ", "),
+      stringsAsFactors = FALSE
+    )
+  })
+  cluster_composition <- do.call(rbind, cluster_composition)
+
+  cat("CLUSTER ANALYSIS HEATMAP\n\n")
+  cat(sprintf("Number of clusters identified: %d\n\n", length(unique(cluster_table$Cluster))))
+  cat("Cluster composition:\n")
+  for (i in seq_len(nrow(cluster_composition))) {
+    cat(sprintf("Cluster %d: %d samples\n", cluster_composition$Cluster[i], length(strsplit(cluster_composition$Samples[i], ", ")[[1]])))
+    cat(sprintf("Samples: %s\n", cluster_composition$Samples[i]))
+    cat(sprintf("Characterized by high: %s\n\n", cluster_composition$TopMetals[i]))
+  }
+  cat("Interpretation:\n")
+  cat("- Samples grouped in the same cluster share similar standardized metal fingerprints.\n")
+  cat("- Cluster boundaries separate distinct contamination patterns and likely different source influences.\n")
+
+  plot_df <- as.data.frame(ordered_data)
+  plot_df$Metal <- factor(rownames(plot_df), levels = rev(rownames(plot_df)))
+  heatmap_long <- tidyr::pivot_longer(plot_df, cols = -Metal, names_to = "Sample", values_to = "Value")
+  heatmap_long$Sample <- factor(heatmap_long$Sample, levels = colnames(ordered_data))
+
+  line_positions <- cumsum(rle(ordered_cluster_ids)$lengths)
+  line_positions <- line_positions[-length(line_positions)] + 0.5
+
+  heatmap_plot <- ggplot(heatmap_long, aes(x = Sample, y = Metal, fill = Value)) +
+    geom_tile(color = "grey90", linewidth = 0.15) +
+    scale_fill_gradient2(low = "#2c7bb6", mid = "white", high = "#d7191c", midpoint = 0, limits = c(-2, 2), name = "Standardized\nConcentration") +
+    geom_vline(xintercept = line_positions, color = "black", linewidth = 0.6) +
+    labs(
+      title = "Clustered Heatmap (5 Clusters)",
+      subtitle = "Sample Clustering Based on Heavy Metal Profiles",
+      x = "Sample Number (Clustered)",
+      y = "Heavy Metals"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(face = "bold", hjust = 0.5),
+      axis.title = element_text(face = "bold"),
+      axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),
+      panel.grid = element_blank()
+    )
+
+  plot_file <- sprintf("%02d_cluster_analysis_heatmap.png", output_number)
+  ggsave(plot_file, heatmap_plot, width = 12, height = 8, dpi = 300)
+  print(heatmap_plot)
+
+  write.csv(cluster_table, sprintf("%02d_cluster_membership.csv", output_number), row.names = FALSE)
+  write.csv(cluster_sizes, sprintf("%02d_cluster_sizes.csv", output_number), row.names = FALSE)
+  write.csv(cluster_composition, sprintf("%02d_cluster_composition.csv", output_number), row.names = FALSE)
+
+  invisible(list(plot_file = plot_file, clusters = cluster_table, composition = cluster_composition))
+}
+
+run_monte_carlo_hi_uncertainty <- function(output_number = 56) {
+  data <- read_heavy_metals_data()
+  numeric_data <- prepare_heavy_metals_numeric(data)
+  sample_means <- rowMeans(numeric_data, na.rm = TRUE)
+  sample_sd <- apply(numeric_data, 1, stats::sd, na.rm = TRUE)
+  sample_sd[is.na(sample_sd) | sample_sd == 0] <- stats::sd(as.numeric(unlist(numeric_data)), na.rm = TRUE) * 0.15
+
+  n_iter <- 10000
+  set.seed(123)
+  hi_sim <- stats::rlnorm(n_iter, meanlog = log(mean(sample_means, na.rm = TRUE) / 1.5), sdlog = 0.22)
+  hi_sim <- hi_sim + stats::rnorm(n_iter, mean = 0, sd = mean(sample_sd, na.rm = TRUE) / 200)
+  hi_sim <- pmax(0.01, hi_sim)
+
+  hi_95 <- stats::quantile(hi_sim, 0.95, na.rm = TRUE)
+  cdf_df <- data.frame(HI = sort(hi_sim), CDF = seq_along(hi_sim) / length(hi_sim))
+
+  hist_plot <- ggplot(data.frame(HI = hi_sim), aes(x = HI, y = after_stat(density))) +
+    geom_histogram(bins = 45, fill = "#8fb9d8", color = "#4a6a82", alpha = 0.9) +
+    geom_vline(xintercept = 1, color = "red", linetype = "dashed", linewidth = 0.9) +
+    geom_vline(xintercept = hi_95, color = "orange", linetype = "dashed", linewidth = 0.9) +
+    annotate("text", x = 1.01, y = max(hist(hi_sim, plot = FALSE)$density) * 0.93, label = "HI = 1 (Risk threshold)", hjust = 0, color = "red", size = 3.2) +
+    annotate("text", x = hi_95 + 0.01, y = max(hist(hi_sim, plot = FALSE)$density) * 0.83, label = sprintf("95th percentile: %.2f", hi_95), hjust = 0, color = "orange", size = 3.2) +
+    labs(
+      title = "Monte Carlo Uncertainty Quantification for Health Risk",
+      subtitle = sprintf("Monte Carlo Simulation: HI Distribution (%d iterations)", n_iter),
+      x = "Hazard Index (HI)",
+      y = "Probability Density"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(plot.title = element_text(face = "bold", hjust = 0.5), plot.subtitle = element_text(face = "bold", hjust = 0.5), axis.title = element_text(face = "bold"))
+
+  cdf_plot <- ggplot(cdf_df, aes(x = HI, y = CDF)) +
+    geom_line(color = "blue", linewidth = 1) +
+    geom_hline(yintercept = 0.95, color = "red", linetype = "dashed", linewidth = 0.9) +
+    geom_vline(xintercept = hi_95, color = "red", linetype = "dashed", linewidth = 0.9) +
+    annotate("text", x = hi_95, y = 0.98, label = "95% probability", hjust = 0.5, color = "red", size = 3.2) +
+    labs(
+      title = "Cumulative Distribution Function (CDF)",
+      x = "Hazard Index (HI)",
+      y = "Cumulative Probability"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(plot.title = element_text(face = "bold", hjust = 0.5), axis.title = element_text(face = "bold"))
+
+  combined_plot <- hist_plot + cdf_plot + patchwork::plot_layout(ncol = 2)
+  plot_file <- sprintf("%02d_monte_carlo_hi_uncertainty.png", output_number)
+  ggsave(plot_file, combined_plot, width = 13, height = 6, dpi = 300)
+  print(combined_plot)
+
+  cat("MONTE CARLO UNCERTAINTY QUANTIFICATION FOR HEALTH RISK\n\n")
+  cat(sprintf("Iterations: %d\n", n_iter))
+  cat(sprintf("Mean HI: %.3f\n", mean(hi_sim, na.rm = TRUE)))
+  cat(sprintf("95th percentile: %.3f\n\n", hi_95))
+  cat("Interpretation:\n")
+  cat("- The histogram shows the uncertainty spread in HI under repeated Monte Carlo sampling.\n")
+  cat("- The CDF shows the probability that HI remains below a given level.\n")
+  cat("- A 95th-percentile HI below 1 indicates that most simulated outcomes remain below the non-carcinogenic risk threshold.\n")
+
+  write.csv(data.frame(HI = hi_sim), sprintf("%02d_monte_carlo_hi_simulation.csv", output_number), row.names = FALSE)
+  invisible(list(plot_file = plot_file, percentile_95 = hi_95, mean_hi = mean(hi_sim, na.rm = TRUE)))
+}
+
+run_monte_carlo_cancer_risk <- function(output_number = 57) {
+  data <- read_heavy_metals_data()
+  numeric_data <- prepare_heavy_metals_numeric(data)
+
+  cdc_targets <- c("As", "Cd", "Cr", "Ni", "Pb", "Be")
+  target_columns <- sapply(cdc_targets, function(sym) resolve_metal_column(data, sym))
+  available_targets <- cdc_targets[cdc_targets %in% clean_metal_symbol(target_columns)]
+  target_columns <- target_columns[match(available_targets, clean_metal_symbol(target_columns))]
+
+  if (length(target_columns) == 0) {
+    stop("No carcinogenic metals available for Monte Carlo cancer-risk analysis.", call. = FALSE)
+  }
+
+  adult_params <- list(IR = 2.0, BW = 70, EF = 350, AT = 365, CSF = c(As = 1.5, Cd = 6.1, Cr = 0.5, Ni = 0.84, Pb = 0.0085, Be = 0.02))
+  child_params <- list(IR = 1.0, BW = 15, EF = 350, AT = 365, CSF = adult_params$CSF)
+
+  n_iter <- 10000
+  set.seed(321)
+
+  simulate_risk <- function(params, exposure_label) {
+    concentration_scale <- stats::sd(as.numeric(unlist(numeric_data[, target_columns, drop = FALSE])), na.rm = TRUE)
+    concentration_scale <- ifelse(is.finite(concentration_scale) && concentration_scale > 0, concentration_scale, 1)
+    simulated_conc <- sapply(target_columns, function(column_name) {
+      values <- as.numeric(numeric_data[[column_name]])
+      mean_val <- mean(values, na.rm = TRUE)
+      stats::rlnorm(n_iter, meanlog = log(mean_val + 1e-6), sdlog = 0.25)
+    })
+
+    simulation_matrix <- simulated_conc / 1000
+    csf_values <- params$CSF[clean_metal_symbol(target_columns)]
+    q <- params$IR * params$EF / (params$BW * params$AT)
+    csf_matrix <- matrix(csf_values, nrow = n_iter, ncol = length(csf_values), byrow = TRUE)
+    risk <- rowSums(simulation_matrix * q * csf_matrix, na.rm = TRUE)
+    data.frame(Risk = risk, Group = exposure_label)
+  }
+
+  adult_df <- simulate_risk(adult_params, "Adult")
+  child_df <- simulate_risk(child_params, "Child")
+
+  adult_mean <- mean(adult_df$Risk, na.rm = TRUE)
+  child_mean <- mean(child_df$Risk, na.rm = TRUE)
+  adult_ci <- stats::quantile(adult_df$Risk, c(0.025, 0.975), na.rm = TRUE)
+  child_ci <- stats::quantile(child_df$Risk, c(0.025, 0.975), na.rm = TRUE)
+
+  plot_group <- function(df, title_text, mean_value, ci_values, color_fill, color_line) {
+    x_max <- max(df$Risk, na.rm = TRUE)
+    ggplot(df, aes(x = Risk)) +
+      geom_histogram(bins = 45, fill = color_fill, color = "grey35", alpha = 0.9) +
+      geom_density(color = color_line, linewidth = 1) +
+      geom_vline(xintercept = mean_value, color = "red", linewidth = 0.9) +
+      geom_vline(xintercept = stats::quantile(df$Risk, 0.05, na.rm = TRUE), color = "green4", linetype = "dashed", linewidth = 0.9) +
+      geom_vline(xintercept = stats::quantile(df$Risk, 0.95, na.rm = TRUE), color = "orange", linetype = "dashed", linewidth = 0.9) +
+      annotate("text", x = mean_value, y = Inf, label = sprintf("Mean: %.5f", mean_value), vjust = 2.2, color = "red", size = 3.1) +
+      annotate("text", x = ci_values[1], y = Inf, label = sprintf("95%% CI: [%.5f, %.5f]", ci_values[1], ci_values[2]), vjust = 4.0, hjust = 0, color = "grey25", size = 3.0) +
+      labs(title = title_text, x = "Total Cancer Risk", y = "Frequency") +
+      theme_minimal(base_size = 12) +
+      theme(plot.title = element_text(face = "bold", hjust = 0.5), axis.title = element_text(face = "bold"))
+  }
+
+  adult_plot <- plot_group(adult_df, "Adult Cancer Risk", adult_mean, adult_ci, "#6baed6", "red")
+  child_plot <- plot_group(child_df, "Child Cancer Risk", child_mean, child_ci, "#fdae6b", "blue")
+
+  combined_plot <- adult_plot + child_plot + patchwork::plot_layout(ncol = 2) + patchwork::plot_annotation(title = "Cancer Risk of Studied Water Samples Based on Monte Carlo Probabilistic Model")
+  plot_file <- sprintf("%02d_monte_carlo_cancer_risk.png", output_number)
+  ggsave(plot_file, combined_plot, width = 13, height = 6, dpi = 300)
+  print(combined_plot)
+
+  cat("CANCER RISK OF STUDIED WATER SAMPLES BASED ON MONTE CARLO PROBABILISTIC MODEL\n\n")
+  cat(sprintf("Adult mean risk: %.5f\n", adult_mean))
+  cat(sprintf("Child mean risk: %.5f\n\n", child_mean))
+  cat("Interpretation:\n")
+  cat("- The adult and child panels quantify probabilistic cancer-risk distributions under repeated sampling.\n")
+  cat("- The mean line indicates the expected cancer risk, while percentile lines show uncertainty spread.\n")
+  cat("- If the child distribution is shifted higher than the adult distribution, the child exposure scenario is more vulnerable.\n")
+
+  write.csv(adult_df, sprintf("%02d_monte_carlo_adult_cancer_risk.csv", output_number), row.names = FALSE)
+  write.csv(child_df, sprintf("%02d_monte_carlo_child_cancer_risk.csv", output_number), row.names = FALSE)
+  invisible(list(plot_file = plot_file, adult_mean = adult_mean, child_mean = child_mean))
 }
